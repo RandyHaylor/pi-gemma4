@@ -21,6 +21,13 @@
  *       Unset / empty -> inject nothing; payload passes through untouched.
  *   PI_PROVIDER_TRAFFIC_LOG_PATH      -> file to append request payloads (before AND
  *       after injection) + response status/headers to (unset -> no logging)
+ *   PI_PER_TURN_MAX_COMPLETION_TOKENS -> a positive integer merged as `max_completion_tokens`
+ *       into every outgoing provider payload (OVERRIDING any value pi set), so THIS pi
+ *       launch's turn is hard-capped at that many output tokens. In json mode pi runs one
+ *       process PER TURN, so setting this env per launch gives a PER-TURN output cap
+ *       (llama.cpp enforces max_completion_tokens; it ignores the older max_tokens). Unset /
+ *       non-positive -> no per-turn cap. This is how Unharness's per_turn_output_limit
+ *       (the form-driven conveyor's per-step bound) is enforced for the pi/gemma harness.
  */
 
 import { appendFileSync } from "node:fs";
@@ -40,6 +47,14 @@ function readConcretePayloadInjection(): Record<string, unknown> | undefined {
 	return undefined;
 }
 
+function readPerTurnMaxCompletionTokens(): number | undefined {
+	const raw = process.env.PI_PER_TURN_MAX_COMPLETION_TOKENS;
+	if (raw === undefined || raw.trim() === "") return undefined;
+	const parsed = Number.parseInt(raw.trim(), 10);
+	if (Number.isFinite(parsed) && parsed > 0) return parsed;
+	return undefined;  // non-positive / malformed -> no per-turn cap
+}
+
 function appendProviderTrafficLogLine(text: string): void {
 	const logPath = process.env.PI_PROVIDER_TRAFFIC_LOG_PATH;
 	if (!logPath) return;
@@ -52,21 +67,29 @@ function appendProviderTrafficLogLine(text: string): void {
 
 export default function reasoningControlAndProviderTrafficLogExtension(pi: ExtensionAPI) {
 	const concretePayloadInjection = readConcretePayloadInjection();
+	const perTurnMaxCompletionTokens = readPerTurnMaxCompletionTokens();
 
 	pi.on("before_provider_request", (event) => {
 		appendProviderTrafficLogLine(
 			"\n########## PROVIDER REQUEST injection=" +
 				JSON.stringify(concretePayloadInjection || null) +
+				" perTurnMaxCompletionTokens=" +
+				JSON.stringify(perTurnMaxCompletionTokens ?? null) +
 				" ##########\nBEFORE: " +
 				JSON.stringify(event.payload) +
 				"\n",
 		);
-		if (concretePayloadInjection !== undefined) {
-			const modifiedPayload = { ...event.payload, ...concretePayloadInjection };
+		if (concretePayloadInjection !== undefined || perTurnMaxCompletionTokens !== undefined) {
+			const modifiedPayload = { ...event.payload, ...(concretePayloadInjection || {}) };
+			if (perTurnMaxCompletionTokens !== undefined) {
+				// Per-turn hard cap: llama.cpp enforces max_completion_tokens (ignores the
+				// older max_tokens). Overrides whatever pi set for this turn.
+				modifiedPayload.max_completion_tokens = perTurnMaxCompletionTokens;
+			}
 			appendProviderTrafficLogLine("AFTER:  " + JSON.stringify(modifiedPayload) + "\n");
 			return modifiedPayload;
 		}
-		// no injection configured: leave the payload untouched
+		// nothing to inject: leave the payload untouched
 		return undefined;
 	});
 
